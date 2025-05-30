@@ -22,7 +22,6 @@ def load_base(uploaded):
 df_cat    = load_catalog(catalog_file)
 df_loaded = load_base(base_file)
 
-# ─── Solo si subió ambos archivos ─────────────────
 if df_cat is not None and df_loaded is not None:
 
     # ── Inicializar session_state ────────────────────
@@ -34,11 +33,10 @@ if df_cat is not None and df_loaded is not None:
     # ── 2) Búsqueda y selección con clic ─────────────
     st.header("🔎 Buscar producto en catálogo")
     query = st.text_input("Buscar por código o nombre:")
-    if query:
-        mask    = df_cat.apply(lambda r: query.lower() in str(r.values).lower(), axis=1)
-        df_filt = df_cat[mask]
-    else:
-        df_filt = df_cat
+    df_filt = (
+        df_cat[df_cat.apply(lambda r: query.lower() in str(r.values).lower(), axis=1)]
+        if query else df_cat
+    )
 
     # Configura AgGrid para selección de fila única
     gb = GridOptionsBuilder.from_dataframe(df_filt)
@@ -55,8 +53,10 @@ if df_cat is not None and df_loaded is not None:
     )
 
     selected = grid_resp["selected_rows"]
-    if selected:
-        codigo = selected[0]["Cod_Prod"]
+    # Evitamos el ValueError comprobando la longitud
+    if isinstance(selected, list) and len(selected) > 0:
+        row0   = selected[0]
+        codigo = row0.get("Cod_Prod")
         st.success(f"Producto seleccionado: **{codigo}**")
     else:
         codigo = None
@@ -100,8 +100,8 @@ if df_cat is not None and df_loaded is not None:
             key="edit_prod"
         )
         if prod_edit:
-            idx = df_db.index[df_db["CodProd"] == prod_edit][0]
-            curr_unit = float(df_db.at[idx, "Precio 2"])
+            idx        = df_db.index[df_db["CodProd"] == prod_edit][0]
+            curr_unit  = float(df_db.at[idx, "Precio 2"])
             curr_units = int(df_db.at[idx, "Precio 1"] / curr_unit) if curr_unit else 1
 
             new_unit  = st.number_input(
@@ -134,9 +134,7 @@ if df_cat is not None and df_loaded is not None:
             key="del_prod"
         )
         if st.button("❌ Eliminar registro", key="apply_delete"):
-            st.session_state.db = df_db[
-                df_db["CodProd"] != prod_del
-            ].reset_index(drop=True)
+            st.session_state.db = df_db[df_db["CodProd"] != prod_del].reset_index(drop=True)
             st.success(f"✔️ {prod_del} eliminado")
             df_db = st.session_state.db
 
