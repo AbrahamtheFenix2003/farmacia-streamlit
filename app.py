@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-
-# Import para AgGrid
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 # ─── Configuración de la página ────────────────────
@@ -42,7 +40,7 @@ if df_cat is not None and df_loaded is not None:
     else:
         df_filt = df_cat
 
-    # Configuramos AgGrid para selección de fila única
+    # Configura AgGrid para selección de fila única
     gb = GridOptionsBuilder.from_dataframe(df_filt)
     gb.configure_selection("single", use_checkbox=False)
     grid_options = gb.build()
@@ -64,7 +62,7 @@ if df_cat is not None and df_loaded is not None:
         codigo = None
         st.info("➡️ Haz clic en una fila para seleccionar el producto")
 
-    # ── 3) Precios y cálculo (sólo si hay selección) ──
+    # ── 3) Precios y cálculo (solo si hay selección) ──
     if codigo:
         st.subheader("💲 Precios")
         precio_unit = st.number_input("Precio unitario (Precio 2)", min_value=0.0, format="%.2f")
