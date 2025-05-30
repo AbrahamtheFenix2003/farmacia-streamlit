@@ -3,10 +3,10 @@ import pandas as pd
 from io import BytesIO
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
-# ─── Configuración de la página ────────────────────
+# ─── Configuración ────────────────────────────────
 st.set_page_config(page_title="Carga automática farmacia", layout="wide")
 
-# ─── Subida de archivos ────────────────────────────
+# ─── Carga de archivos ────────────────────────────
 st.sidebar.header("📂 Cargar archivos")
 catalog_file = st.sidebar.file_uploader("Catálogo (.xlsx)", type="xlsx")
 base_file    = st.sidebar.file_uploader("Base mensual (.xlsx)", type="xlsx")
@@ -22,61 +22,60 @@ def load_base(f):
 df_cat    = load_catalog(catalog_file)
 df_loaded = load_base(base_file)
 
+# ─── Espera a que suban los dos archivos ──────────
 if df_cat is None or df_loaded is None:
     st.sidebar.info("📥 Sube ambos archivos para continuar")
     st.stop()
 
-# ─── Inicializar base en session_state ────────────
+# ─── Inicializa session_state ─────────────────────
 if "db" not in st.session_state:
-    # normalizar CodEstab a 7 dígitos
     df_loaded["CodEstab"] = df_loaded["CodEstab"].astype(str).str.zfill(7)
     st.session_state.db   = df_loaded.copy()
+if "selected_code" not in st.session_state:
+    st.session_state.selected_code = None
 
 df_db = st.session_state.db
 
-# ─── 1) Buscar y seleccionar con AgGrid ───────────
-st.header("🔎 Buscar producto en catálogo")
-query = st.text_input("Buscar por código o nombre:")
-df_filt = (
-    df_cat[df_cat.apply(lambda r: query.lower() in str(r.values).lower(), axis=1)]
-    if query else
-    df_cat
-)
+# ─── 1) Selección de producto con AgGrid ─────────
+st.header("🔎 Buscar y seleccionar producto")
+query = st.text_input("Buscar por código o nombre:", value="")
+df_filt = df_cat[df_cat.apply(lambda r: query.lower() in str(r.values).lower(), axis=1)] if query else df_cat
 
-# configurar AgGrid
+# Configura la tabla clicable
 gb = GridOptionsBuilder.from_dataframe(df_filt)
 gb.configure_selection("single", use_checkbox=False)
-grid_opts = gb.build()
-
-grid_resp = AgGrid(
+grid = AgGrid(
     df_filt,
-    gridOptions=grid_opts,
+    gridOptions=gb.build(),
     update_mode=GridUpdateMode.SELECTION_CHANGED,
     height=300,
     fit_columns_on_grid_load=True
 )
 
-# procesar selección
-selected = grid_resp["selected_rows"]
-if isinstance(selected, list) and len(selected) > 0:
-    st.session_state.selected_code = selected[0]["Cod_Prod"]
+# Procesa la fila seleccionada
+sel = grid["selected_rows"]
+if isinstance(sel, list) and sel:
+    new_code = sel[0].get("Cod_Prod")
+    # Si cambió la selección, guarda y recarga la app
+    if new_code != st.session_state.selected_code:
+        st.session_state.selected_code = new_code
+        st.experimental_rerun()
 
-codigo = st.session_state.get("selected_code", None)
-
+codigo = st.session_state.selected_code
 if codigo:
     st.success(f"✅ Producto seleccionado: **{codigo}**")
 else:
-    st.info("➡️ Haz clic en una fila para seleccionar el producto")
+    st.info("➡️ Haz clic en una fila para seleccionar")
 
-# ─── 2) Precios y añadir (solo tras selección) ────
+# ─── 2) Precios y Añadir ──────────────────────────
 if codigo:
-    st.subheader("💲 Precios")
-    precio_unit = st.number_input("Precio unitario (Precio 2)", min_value=0.0, format="%.2f")
-    unidades    = st.number_input("Unidades por caja",      min_value=1,   step=1)
+    st.subheader("💲 Precios y Añadir")
+    precio_unit = st.number_input("Precio unitario (Precio 2)", min_value=0.0, format="%.2f", key="unit")
+    unidades    = st.number_input("Unidades por caja",      min_value=1,   step=1,        key="box")
     precio_caja = unidades * precio_unit
     st.write(f"**Precio de caja (Precio 1):** {precio_caja:,.2f}")
 
-    if st.button("➕ Añadir a la base"):
+    if st.button("➕ Añadir a la base", key="add"):
         if codigo in df_db["CodProd"].values:
             st.warning("⚠️ Ya existe ese CodProd.")
         else:
@@ -94,69 +93,56 @@ if codigo:
 st.subheader("📋 Base mensual actualizada")
 st.dataframe(df_db, use_container_width=True, height=300)
 
-# ─── 4) Editar un registro ────────────────────────
+# ─── 4) Editar ─────────────────────────────────────
 with st.expander("✏️ Editar un registro"):
-    prod_edit = st.selectbox(
-        "Selecciona CodProd a editar",
-        options=df_db["CodProd"].unique(),
-        key="edit_prod"
-    )
-    if prod_edit:
-        idx = df_db.index[df_db["CodProd"] == prod_edit][0]
-        curr_unit  = float(df_db.at[idx, "Precio 2"])
-        curr_units = int(df_db.at[idx, "Precio 1"] / curr_unit) if curr_unit else 1
+    opciones = df_db["CodProd"].unique().tolist()
+    edited = st.selectbox("Selecciona CodProd a editar", options=opciones, key="edit_sel")
+    if edited:
+        idx = df_db.index[df_db["CodProd"] == edited][0]
+        curr_u = float(df_db.at[idx, "Precio 2"])
+        curr_b = int(df_db.at[idx, "Precio 1"] / curr_u) if curr_u else 1
 
-        new_unit  = st.number_input("Nuevo precio unitario", value=curr_unit, format="%.2f", key="new_unit")
-        new_units = st.number_input("Nuevas unidades por caja", value=curr_units, step=1, key="new_units")
-        new_caja  = new_unit * new_units
-        st.write(f"→ Nuevo precio de caja: {new_caja:,.2f}")
+        nu = st.number_input("Nuevo precio unitario", value=curr_u, format="%.2f", key="nu")
+        nb = st.number_input("Nuevas unidades por caja", value=curr_b, step=1, key="nb")
+        nc = nu * nb
+        st.write(f"→ Nuevo Precio caja: {nc:,.2f}")
 
-        if st.button("💾 Guardar cambios", key="save_edit"):
-            df_db.at[idx, "Precio 2"] = new_unit
-            df_db.at[idx, "Precio 1"] = new_caja
+        if st.button("💾 Guardar cambios", key="save"):
+            df_db.at[idx, "Precio 2"] = nu
+            df_db.at[idx, "Precio 1"] = nc
             st.session_state.db       = df_db
-            st.success(f"✔️ {prod_edit} actualizado")
+            st.success(f"✔️ {edited} actualizado")
 
-# ─── 5) Eliminar un registro ───────────────────────
+# ─── 5) Eliminar ────────────────────────────────────
 with st.expander("🗑️ Eliminar un registro"):
-    prod_del = st.selectbox(
-        "Selecciona CodProd a eliminar",
-        options=df_db["CodProd"].unique(),
-        key="del_prod"
-    )
-    if st.button("❌ Eliminar registro", key="apply_delete"):
-        st.session_state.db = df_db[df_db["CodProd"] != prod_del].reset_index(drop=True)
-        st.success(f"✔️ {prod_del} eliminado")
+    opciones = df_db["CodProd"].unique().tolist()
+    deleted = st.selectbox("Selecciona CodProd a eliminar", options=opciones, key="del_sel")
+    if st.button("❌ Eliminar registro", key="del_btn"):
+        st.session_state.db = df_db[df_db["CodProd"] != deleted].reset_index(drop=True)
+        st.success(f"✔️ {deleted} eliminado")
 
-# ─── 6) Descargas ──────────────────────────────────
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
+# ─── 6) Descarga XLSX y CSV ────────────────────────
+def to_excel_bytes(df):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
         df.to_excel(w, index=False, sheet_name="Base")
-        bk = w.book
-        ws = w.sheets["Base"]
-        fmt_txt = bk.add_format({"num_format":"@",    "font":"Calibri"})
-        fmt_num = bk.add_format({"num_format":"0.00", "font":"Calibri"})
+        bk = w.book; ws = w.sheets["Base"]
+        fmt_txt = bk.add_format({"num_format":"@", "font":"Calibri"})
+        fmt_num = bk.add_format({"num_format":"0.00","font":"Calibri"})
         for i, c in enumerate(df.columns):
-            if c in ("CodEstab","CodProd"):
-                ws.set_column(i, i, 15, fmt_txt)
-            elif c in ("Precio 1","Precio 2"):
-                ws.set_column(i, i, 15, fmt_num)
-            else:
-                ws.set_column(i, i, 15)
+            if c in ("CodEstab","CodProd"): ws.set_column(i, i, 15, fmt_txt)
+            elif c in ("Precio 1","Precio 2"): ws.set_column(i, i, 15, fmt_num)
+            else: ws.set_column(i, i, 15)
     return buf.getvalue()
 
-st.download_button(
-    "⬇️ Descargar base_actualizada.xlsx",
+st.download_button("⬇️ Descargar XLSX",
     data=to_excel_bytes(df_db),
     file_name="base_actualizada.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
-
-csv_bytes = df_db.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "⬇️ Descargar base_actualizada.csv",
-    data=csv_bytes,
+csv_data = df_db.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Descargar CSV",
+    data=csv_data,
     file_name="base_actualizada.csv",
     mime="text/csv"
 )
