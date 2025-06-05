@@ -56,8 +56,7 @@ def procesar_archivos(catalog_bytes: bytes, bd_bytes: bytes):
         skiprows=6,   # fila 7 (índice 6) con encabezados reales
         engine="openpyxl",
     )
-    # Renombramos solo las columnas clave para simplificar el flujo,
-    # pero dejamos el resto intacto para mostrar detalles del producto.
+    # Renombramos solo las columnas clave, pero mantenemos el resto intacto
     df_cat = df_cat.rename(
         columns={
             "Cod_Prod": "CodProd",
@@ -65,7 +64,7 @@ def procesar_archivos(catalog_bytes: bytes, bd_bytes: bytes):
             "Fracción": "Fraccion",
         }
     )
-    # Asegurar tipos numéricos en esas dos:
+    # Asegurar tipos numéricos en CodProd y Fraccion
     df_cat["CodProd"] = pd.to_numeric(df_cat["CodProd"], errors="coerce").astype("Int64")
     df_cat["Fraccion"] = pd.to_numeric(df_cat["Fraccion"], errors="coerce").astype("Int64")
 
@@ -116,58 +115,83 @@ else:
 
 
 # ———————————
-# 4) CATÁLOGO INTERACTIVO (AgGrid)
+# 4) CATÁLOGO INTERACTIVO CON FILTRO (BUSCADOR + AgGrid REDUCIDO)
 # ———————————
-st.subheader("🔍 Catálogo de Productos")
+st.subheader("🔍 Catálogo de Productos (busca por nombre o código)")
 
-gb = GridOptionsBuilder.from_dataframe(df_cat)
+# 4.1) Campo de búsqueda
+busqueda = st.text_input(
+    label="Escribe parte del nombre o código del producto:",
+    placeholder="Ejemplo: 'A FOLIC' o '54520' o 'flu'",
+)
+
+# 4.2) Si el usuario no ha escrito nada o menos de 2 caracteres, mostramos aviso
+if not busqueda or len(busqueda.strip()) < 2:
+    st.info("🔎 Ingresa al menos 2 caracteres para buscar en el catálogo.")
+    st.stop()
+
+# 4.3) Convertimos la búsqueda a minúsculas
+term = busqueda.strip().lower()
+
+# 4.4) Filtramos por CodProd o Nombre
+df_filtrado = df_cat[
+    df_cat["CodProd"].astype(str).str.contains(term, case=False, na=False) |
+    df_cat["Nombre"].str.lower().str.contains(term)
+].copy()
+
+# 4.5) Si no hay coincidencias, informamos
+if df_filtrado.empty:
+    st.warning(f"❌ No se encontraron productos que contengan '{busqueda}'.")
+    st.stop()
+
+# 4.6) Renderizamos sólo el subconjunto en AgGrid
+gb = GridOptionsBuilder.from_dataframe(df_filtrado)
 gb.configure_default_column(filter=True, sortable=True, resizable=True)
 gb.configure_selection(selection_mode="single", use_checkbox=False)
 gb.configure_grid_options(domLayout="normal")
 
 grid_response = AgGrid(
-    df_cat,
+    df_filtrado,
     gridOptions=gb.build(),
-    height=350,
+    height=300,
     width="100%",
     update_mode=GridUpdateMode.SELECTION_CHANGED,
     allow_unsafe_jscode=True,
     fit_columns_on_grid_load=True,
 )
 
-# Comprobamos con seguridad si hay fila seleccionada
-filas_seleccionadas = grid_response["selected_rows"]
-tiene_seleccion = False
-if filas_seleccionadas is not None:
-    if isinstance(filas_seleccionadas, pd.DataFrame):
-        tiene_seleccion = not filas_seleccionadas.empty
+# 4.7) Detectamos si el usuario hizo clic en alguna fila del subconjunto
+filas_sel = grid_response["selected_rows"]
+tiene_sel = False
+if filas_sel is not None:
+    if isinstance(filas_sel, pd.DataFrame):
+        tiene_sel = not filas_sel.empty
     else:
-        tiene_seleccion = len(filas_seleccionadas) > 0
+        tiene_sel = len(filas_sel) > 0
 
-# Variables para el bloque de selección
+# Variables para la sección de selección
 cod = None
 fraccion = None
 
-if tiene_seleccion:
-    # Extraemos la fila como dict
-    if isinstance(filas_seleccionadas, pd.DataFrame):
-        fila = filas_seleccionadas.iloc[0].to_dict()
+if tiene_sel:
+    # 4.8) Extraemos esa fila como dict
+    if isinstance(filas_sel, pd.DataFrame):
+        fila = filas_sel.iloc[0].to_dict()
     else:
-        fila = filas_seleccionadas[0]
+        fila = filas_sel[0]
 
     cod = int(fila["CodProd"])
     nombre = fila["Nombre"]
     fraccion = int(fila["Fraccion"])
 
-    # Mostramos todos los detalles del producto (todas las columnas del catálogo)
+    # 4.9) Mostramos todos los detalles del producto (todas las columnas del catálogo)
     st.markdown(f"**Producto seleccionado:** `{nombre}` (CodProd = {cod})")
-    st.markdown("- **Detalles del catálogo:**")
-    # Iteramos sobre cada columna menos CodProd y Fraccion
+    st.markdown("**Detalles del catálogo:**")
     for col, val in fila.items():
         if col not in ["CodProd", "Fraccion"]:
             st.write(f"- {col}: {val}")
 
-    # 4.1) Pedir precio unitario
+    # 4.10) Campo para ingresar precio unitario
     precio_unit = st.number_input(
         label="💲 Precio Unitario (Precio 2)",
         min_value=0.00,
@@ -176,36 +200,28 @@ if tiene_seleccion:
         key="precio_unitario_input"
     )
 
-    # 4.1a) Calcular y mostrar el total en vivo
-    if fraccion is not None:
-        precio_total_vivo = round(fraccion * precio_unit, 2)
-        st.markdown(
-            f"**Precio Total (Fracción × Unitario):** {fraccion} × {precio_unit:.2f} = **{precio_total_vivo:.2f}**"
-        )
+    # 4.11) Cálculo en vivo del precio total
+    precio_total_vivo = round(fraccion * precio_unit, 2)
+    st.markdown(f"**Precio Total (Fracción × Unitario):** {fraccion} × {precio_unit:.2f} = **{precio_total_vivo:.2f}**")
 
-    # 4.2) Botón para agregar a BD (con chequeo de duplicados)
+    # 4.12) Botón para agregar a BD (con chequeo de duplicados)
     if st.button("➕ Agregar a BD"):
-        # Chequeo duplicado: si ya existe este CodProd en df_bd
         cod_existentes = st.session_state.df_bd["CodProd"].dropna().astype(int).tolist()
         if cod in cod_existentes:
             st.warning(f"⚠️ El producto con CodProd={cod} ya está en la BD. No se permiten duplicados.")
         else:
-            precio_total = round(fraccion * precio_unit, 2)
             nueva = {
                 "CodEstab": "0021870",
                 "CodProd": cod,
-                "PrecioTotal": precio_total,
+                "PrecioTotal": precio_total_vivo,
                 "PrecioUnit": precio_unit,
                 "Fraccion": fraccion
             }
-            # Insertar en el DataFrame dentro de session_state
             st.session_state.df_bd = pd.concat(
                 [st.session_state.df_bd, pd.DataFrame([nueva])],
                 ignore_index=True
             )
-            st.success(f"Se agregó `{nombre}` → PrecioTotal = {precio_total:.2f}")
-
-            # Refrescamos la copia local para que se muestre de inmediato
+            st.success(f"Se agregó `{nombre}` → PrecioTotal = {precio_total_vivo:.2f}")
             df_bd = st.session_state.df_bd.copy()
 
 st.divider()
@@ -227,7 +243,6 @@ if st.button("🔄 Recalcular PrecioTotal"):
 # ———————————
 st.subheader("🗂️ Base de Datos (Editable)")
 
-# Preparamos una copia sin “Fraccion” para mostrarla
 df_bd_para_editar = st.session_state.df_bd.copy().drop(columns=["Fraccion"])
 
 df_bd_editado = st.data_editor(
@@ -265,7 +280,7 @@ export_df = df_bd.copy()
 export_df = export_df.rename(columns={"PrecioTotal": "Precio 1", "PrecioUnit": "Precio 2"})
 export_df = export_df[["CodEstab", "CodProd", "Precio 1", "Precio 2"]]
 
-# Convertimos “CodProd” a texto antes de exportar para que Excel lo trate como texto
+# Convertimos “CodProd” a texto para que Excel lo trate como texto
 export_df["CodProd"] = export_df["CodProd"].astype(str)
 
 # --- Generar archivo XLSX con formatos de celda usando xlsxwriter ---
@@ -284,7 +299,6 @@ with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
     num_fmt = workbook.add_format({"num_format": "0.00"})
     worksheet.set_column("C:D", None, num_fmt)
 
-# Al salir del bloque 'with', el ExcelWriter ya escribió en el buffer
 data_xlsx = output.getvalue()
 
 st.download_button(
@@ -294,7 +308,7 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# Para CSV, bastará con codificar; “CodProd” ya es string
+# CSV (CodProd ya es string)
 csv_bytes = export_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="📄 Descargar CSV",
