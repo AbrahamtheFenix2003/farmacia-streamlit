@@ -3,146 +3,302 @@ import pandas as pd
 from io import BytesIO
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
-# ─── Configuración ────────────────────────────────
-st.set_page_config(page_title="Carga automática farmacia", layout="wide")
+# ———————————
+# 1) CONFIGURACIÓN BÁSICA DE STREAMLIT
+# ———————————
+st.set_page_config(
+    page_title="Gestor de Productos (Upload Dinámico)",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ─── Carga de archivos ────────────────────────────
-st.sidebar.header("📂 Cargar archivos")
-catalog_file = st.sidebar.file_uploader("Catálogo (.xlsx)", type="xlsx")
-base_file    = st.sidebar.file_uploader("Base mensual (.xlsx)", type="xlsx")
+st.title("📦 Gestor de Catálogo y Base de Datos (con Upload)")
 
-@st.cache_data
-def load_catalog(f):
-    return pd.read_excel(f, header=6) if f else None
+# ———————————
+# 2) UPLOAD DE ARCHIVOS EN SIDEBAR
+# ———————————
+st.sidebar.header("⚙️ Carga de Archivos (Excel)")
+catalog_file = st.sidebar.file_uploader(
+    label="Sube el archivo de Catálogo (.xlsx)",
+    type=["xlsx"],
+    accept_multiple_files=False,
+    key="upload_catalog"
+)
 
-@st.cache_data
-def load_base(f):
-    return pd.read_excel(f) if f else None
+bd_file = st.sidebar.file_uploader(
+    label="Sube el archivo de Base de Datos (.xlsx o .xls)",
+    type=["xlsx", "xls"],
+    accept_multiple_files=False,
+    key="upload_bd"
+)
 
-df_cat    = load_catalog(catalog_file)
-df_loaded = load_base(base_file)
+st.sidebar.markdown(
+    """
+    • El catálogo debe tener columnas:  
+      `Cod_Prod`, `Nom_Prod`, `Fracción` (a partir de la fila 7).  
+    • La BD debe tener columnas:  
+      `CodEstab`, `CodProd`, `Precio 1`, `Precio 2`.  
+    """
+)
 
-# ─── Espera a que suban los dos archivos ──────────
-if df_cat is None or df_loaded is None:
-    st.sidebar.info("📥 Sube ambos archivos para continuar")
+# ———————————
+# 3) CARGA Y NORMALIZACIÓN (una sola vez, al subir archivos)
+# ———————————
+def procesar_archivos(catalog_bytes: bytes, bd_bytes: bytes):
+    """
+    Lee los bytes de ambos Excel y devuelve dos DataFrames: df_cat, df_bd.
+    Asume que el catálogo real arranca en la fila 7 de encabezados.
+    Mantiene todas las columnas del catálogo para mostrarlas al seleccionar.
+    """
+    # 3.1) Procesar Catálogo
+    df_cat = pd.read_excel(
+        BytesIO(catalog_bytes),
+        skiprows=6,   # fila 7 (índice 6) con encabezados reales
+        engine="openpyxl",
+    )
+    # Renombramos solo las columnas clave para simplificar el flujo,
+    # pero dejamos el resto intacto para mostrar detalles del producto.
+    df_cat = df_cat.rename(
+        columns={
+            "Cod_Prod": "CodProd",
+            "Nom_Prod": "Nombre",
+            "Fracción": "Fraccion",
+        }
+    )
+    # Asegurar tipos numéricos en esas dos:
+    df_cat["CodProd"] = pd.to_numeric(df_cat["CodProd"], errors="coerce").astype("Int64")
+    df_cat["Fraccion"] = pd.to_numeric(df_cat["Fraccion"], errors="coerce").astype("Int64")
+
+    # 3.2) Procesar BD
+    df_bd = pd.read_excel(BytesIO(bd_bytes), engine="openpyxl")
+    df_bd = df_bd.rename(columns={"Precio 1": "PrecioTotal", "Precio 2": "PrecioUnit"})
+    df_bd["CodProd"] = pd.to_numeric(df_bd["CodProd"], errors="coerce").astype("Int64")
+    df_bd["CodEstab"] = "0021870"
+    df_bd["PrecioTotal"] = pd.to_numeric(df_bd["PrecioTotal"], errors="coerce")
+    df_bd["PrecioUnit"] = pd.to_numeric(df_bd["PrecioUnit"], errors="coerce")
+
+    # 3.3) Fusionar Fracción del catálogo en la BD (para cálculos)
+    df_bd = df_bd.merge(
+        df_cat[["CodProd", "Fraccion"]],
+        on="CodProd",
+        how="left"
+    )
+
+    return df_cat, df_bd
+
+
+# Solo procesamos UNA VEZ: cuando se cargan ambos archivos.
+if catalog_file and bd_file:
+    # Guardamos los bytes en session_state para reusarlos
+    if "catalog_bytes" not in st.session_state:
+        st.session_state.catalog_bytes = catalog_file.read()
+    if "bd_bytes" not in st.session_state:
+        st.session_state.bd_bytes = bd_file.read()
+
+    # Si no existen los DataFrames en session_state, los procesamos ahora
+    if "df_cat" not in st.session_state or "df_bd" not in st.session_state:
+        try:
+            df_cat, df_bd = procesar_archivos(
+                st.session_state.catalog_bytes,
+                st.session_state.bd_bytes
+            )
+            st.session_state.df_cat = df_cat.copy()
+            st.session_state.df_bd = df_bd.copy()
+        except Exception as e:
+            st.error(f"❌ Error al leer los archivos: {e}")
+            st.stop()
+    else:
+        df_cat = st.session_state.df_cat.copy()
+        df_bd = st.session_state.df_bd.copy()
+else:
+    st.warning("➡️ Sube **ambos** archivos de Excel (Catálogo y BD) en la barra lateral para continuar.")
     st.stop()
 
-# ─── Inicializa session_state ─────────────────────
-if "db" not in st.session_state:
-    df_loaded["CodEstab"] = df_loaded["CodEstab"].astype(str).str.zfill(7)
-    st.session_state.db   = df_loaded.copy()
-if "selected_code" not in st.session_state:
-    st.session_state.selected_code = None
 
-df_db = st.session_state.db
+# ———————————
+# 4) CATÁLOGO INTERACTIVO (AgGrid)
+# ———————————
+st.subheader("🔍 Catálogo de Productos")
 
-# ─── 1) Selección de producto con AgGrid ─────────
-st.header("🔎 Buscar y seleccionar producto")
-query = st.text_input("Buscar por código o nombre:", value="")
-df_filt = df_cat[df_cat.apply(lambda r: query.lower() in str(r.values).lower(), axis=1)] if query else df_cat
+gb = GridOptionsBuilder.from_dataframe(df_cat)
+gb.configure_default_column(filter=True, sortable=True, resizable=True)
+gb.configure_selection(selection_mode="single", use_checkbox=False)
+gb.configure_grid_options(domLayout="normal")
 
-# Configura la tabla clicable
-gb = GridOptionsBuilder.from_dataframe(df_filt)
-gb.configure_selection("single", use_checkbox=False)
-grid = AgGrid(
-    df_filt,
+grid_response = AgGrid(
+    df_cat,
     gridOptions=gb.build(),
+    height=350,
+    width="100%",
     update_mode=GridUpdateMode.SELECTION_CHANGED,
-    height=300,
-    fit_columns_on_grid_load=True
+    allow_unsafe_jscode=True,
+    fit_columns_on_grid_load=True,
 )
 
-# Procesa la fila seleccionada
-sel = grid["selected_rows"]
-if isinstance(sel, list) and sel:
-    new_code = sel[0].get("Cod_Prod")
-    # Si cambió la selección, guarda y recarga la app
-    if new_code != st.session_state.selected_code:
-        st.session_state.selected_code = new_code
-        st.experimental_rerun()
+# Comprobamos con seguridad si hay fila seleccionada
+filas_seleccionadas = grid_response["selected_rows"]
+tiene_seleccion = False
+if filas_seleccionadas is not None:
+    if isinstance(filas_seleccionadas, pd.DataFrame):
+        tiene_seleccion = not filas_seleccionadas.empty
+    else:
+        tiene_seleccion = len(filas_seleccionadas) > 0
 
-codigo = st.session_state.selected_code
-if codigo:
-    st.success(f"✅ Producto seleccionado: **{codigo}**")
-else:
-    st.info("➡️ Haz clic en una fila para seleccionar")
+# Variables para el bloque de selección
+cod = None
+fraccion = None
 
-# ─── 2) Precios y Añadir ──────────────────────────
-if codigo:
-    st.subheader("💲 Precios y Añadir")
-    precio_unit = st.number_input("Precio unitario (Precio 2)", min_value=0.0, format="%.2f", key="unit")
-    unidades    = st.number_input("Unidades por caja",      min_value=1,   step=1,        key="box")
-    precio_caja = unidades * precio_unit
-    st.write(f"**Precio de caja (Precio 1):** {precio_caja:,.2f}")
+if tiene_seleccion:
+    # Extraemos la fila como dict
+    if isinstance(filas_seleccionadas, pd.DataFrame):
+        fila = filas_seleccionadas.iloc[0].to_dict()
+    else:
+        fila = filas_seleccionadas[0]
 
-    if st.button("➕ Añadir a la base", key="add"):
-        if codigo in df_db["CodProd"].values:
-            st.warning("⚠️ Ya existe ese CodProd.")
+    cod = int(fila["CodProd"])
+    nombre = fila["Nombre"]
+    fraccion = int(fila["Fraccion"])
+
+    # Mostramos todos los detalles del producto (todas las columnas del catálogo)
+    st.markdown(f"**Producto seleccionado:** `{nombre}` (CodProd = {cod})")
+    st.markdown("- **Detalles del catálogo:**")
+    # Iteramos sobre cada columna menos CodProd y Fraccion
+    for col, val in fila.items():
+        if col not in ["CodProd", "Fraccion"]:
+            st.write(f"- {col}: {val}")
+
+    # 4.1) Pedir precio unitario
+    precio_unit = st.number_input(
+        label="💲 Precio Unitario (Precio 2)",
+        min_value=0.00,
+        step=0.01,
+        format="%.2f",
+        key="precio_unitario_input"
+    )
+
+    # 4.1a) Calcular y mostrar el total en vivo
+    if fraccion is not None:
+        precio_total_vivo = round(fraccion * precio_unit, 2)
+        st.markdown(
+            f"**Precio Total (Fracción × Unitario):** {fraccion} × {precio_unit:.2f} = **{precio_total_vivo:.2f}**"
+        )
+
+    # 4.2) Botón para agregar a BD (con chequeo de duplicados)
+    if st.button("➕ Agregar a BD"):
+        # Chequeo duplicado: si ya existe este CodProd en df_bd
+        cod_existentes = st.session_state.df_bd["CodProd"].dropna().astype(int).tolist()
+        if cod in cod_existentes:
+            st.warning(f"⚠️ El producto con CodProd={cod} ya está en la BD. No se permiten duplicados.")
         else:
+            precio_total = round(fraccion * precio_unit, 2)
             nueva = {
                 "CodEstab": "0021870",
-                "CodProd":  codigo,
-                "Precio 1": precio_caja,
-                "Precio 2": precio_unit
+                "CodProd": cod,
+                "PrecioTotal": precio_total,
+                "PrecioUnit": precio_unit,
+                "Fraccion": fraccion
             }
-            df_db = pd.concat([df_db, pd.DataFrame([nueva])], ignore_index=True)
-            st.session_state.db = df_db
-            st.success("✔️ Producto añadido")
+            # Insertar en el DataFrame dentro de session_state
+            st.session_state.df_bd = pd.concat(
+                [st.session_state.df_bd, pd.DataFrame([nueva])],
+                ignore_index=True
+            )
+            st.success(f"Se agregó `{nombre}` → PrecioTotal = {precio_total:.2f}")
 
-# ─── 3) Vista previa ──────────────────────────────
-st.subheader("📋 Base mensual actualizada")
-st.dataframe(df_db, use_container_width=True, height=300)
+            # Refrescamos la copia local para que se muestre de inmediato
+            df_bd = st.session_state.df_bd.copy()
 
-# ─── 4) Editar ─────────────────────────────────────
-with st.expander("✏️ Editar un registro"):
-    opciones = df_db["CodProd"].unique().tolist()
-    edited = st.selectbox("Selecciona CodProd a editar", options=opciones, key="edit_sel")
-    if edited:
-        idx = df_db.index[df_db["CodProd"] == edited][0]
-        curr_u = float(df_db.at[idx, "Precio 2"])
-        curr_b = int(df_db.at[idx, "Precio 1"] / curr_u) if curr_u else 1
+st.divider()
 
-        nu = st.number_input("Nuevo precio unitario", value=curr_u, format="%.2f", key="nu")
-        nb = st.number_input("Nuevas unidades por caja", value=curr_b, step=1, key="nb")
-        nc = nu * nb
-        st.write(f"→ Nuevo Precio caja: {nc:,.2f}")
 
-        if st.button("💾 Guardar cambios", key="save"):
-            df_db.at[idx, "Precio 2"] = nu
-            df_db.at[idx, "Precio 1"] = nc
-            st.session_state.db       = df_db
-            st.success(f"✔️ {edited} actualizado")
+# ———————————
+# 5) BOTÓN DE RECALCULAR PRECIOS
+# ———————————
+if st.button("🔄 Recalcular PrecioTotal"):
+    df_bd = st.session_state.df_bd.copy()
+    mask = df_bd["Fraccion"].notna() & df_bd["PrecioUnit"].notna()
+    df_bd.loc[mask, "PrecioTotal"] = (df_bd.loc[mask, "Fraccion"] * df_bd.loc[mask, "PrecioUnit"]).round(2)
+    st.session_state.df_bd = df_bd.copy()
+    st.success("✔️ Todos los precios totales se recalcularon.")
 
-# ─── 5) Eliminar ────────────────────────────────────
-with st.expander("🗑️ Eliminar un registro"):
-    opciones = df_db["CodProd"].unique().tolist()
-    deleted = st.selectbox("Selecciona CodProd a eliminar", options=opciones, key="del_sel")
-    if st.button("❌ Eliminar registro", key="del_btn"):
-        st.session_state.db = df_db[df_db["CodProd"] != deleted].reset_index(drop=True)
-        st.success(f"✔️ {deleted} eliminado")
 
-# ─── 6) Descarga XLSX y CSV ────────────────────────
-def to_excel_bytes(df):
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-        df.to_excel(w, index=False, sheet_name="Base")
-        bk = w.book; ws = w.sheets["Base"]
-        fmt_txt = bk.add_format({"num_format":"@", "font":"Calibri"})
-        fmt_num = bk.add_format({"num_format":"0.00","font":"Calibri"})
-        for i, c in enumerate(df.columns):
-            if c in ("CodEstab","CodProd"): ws.set_column(i, i, 15, fmt_txt)
-            elif c in ("Precio 1","Precio 2"): ws.set_column(i, i, 15, fmt_num)
-            else: ws.set_column(i, i, 15)
-    return buf.getvalue()
+# ———————————
+# 6) EDITOR DE LA BD (sin la columna “Fraccion”)
+# ———————————
+st.subheader("🗂️ Base de Datos (Editable)")
 
-st.download_button("⬇️ Descargar XLSX",
-    data=to_excel_bytes(df_db),
-    file_name="base_actualizada.xlsx",
+# Preparamos una copia sin “Fraccion” para mostrarla
+df_bd_para_editar = st.session_state.df_bd.copy().drop(columns=["Fraccion"])
+
+df_bd_editado = st.data_editor(
+    df_bd_para_editar,
+    num_rows="dynamic",
+    use_container_width=True,
+    key="bd_editor",
+    hide_index=True,
+    column_config={
+        "CodEstab": st.column_config.Column(label="CodEstab"),
+        "CodProd": st.column_config.Column(label="CodProd"),
+        "PrecioTotal": st.column_config.Column(label="PrecioTotal"),
+        "PrecioUnit": st.column_config.Column(label="PrecioUnit"),
+    }
+)
+
+# Si el usuario editó o borró alguna fila, lo reconstruimos en session_state
+if not df_bd_editado.equals(df_bd_para_editar):
+    df_bd_editado["CodEstab"] = "0021870"
+    mapping_fraccion = st.session_state.df_cat.set_index("CodProd")["Fraccion"]
+    df_bd_editado["Fraccion"] = df_bd_editado["CodProd"].map(mapping_fraccion).astype("Int64")
+    st.session_state.df_bd = df_bd_editado.copy()
+    df_bd = st.session_state.df_bd.copy()
+
+st.divider()
+
+
+# ———————————
+# 7) DESCARGA EN XLSX Y CSV CON FORMATO DE CELDA
+# ———————————
+st.subheader("⬇️ Descargar Base de Datos Actualizada")
+
+# Preparamos el DataFrame para exportar
+export_df = df_bd.copy()
+export_df = export_df.rename(columns={"PrecioTotal": "Precio 1", "PrecioUnit": "Precio 2"})
+export_df = export_df[["CodEstab", "CodProd", "Precio 1", "Precio 2"]]
+
+# Convertimos “CodProd” a texto antes de exportar para que Excel lo trate como texto
+export_df["CodProd"] = export_df["CodProd"].astype(str)
+
+# --- Generar archivo XLSX con formatos de celda usando xlsxwriter ---
+output = BytesIO()
+with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    export_df.to_excel(writer, index=False, sheet_name="BD")
+    workbook  = writer.book
+    worksheet = writer.sheets["BD"]
+
+    # Columna A: CodEstab (texto), no requiere formato especial
+    # Columna B: CodProd → forzar texto
+    text_fmt = workbook.add_format({"num_format": "@"})
+    worksheet.set_column("B:B", None, text_fmt)
+
+    # Columnas C & D: “Precio 1” y “Precio 2” → formato numérico con dos decimales
+    num_fmt = workbook.add_format({"num_format": "0.00"})
+    worksheet.set_column("C:D", None, num_fmt)
+
+# Al salir del bloque 'with', el ExcelWriter ya escribió en el buffer
+data_xlsx = output.getvalue()
+
+st.download_button(
+    label="📄 Descargar XLSX",
+    data=data_xlsx,
+    file_name="bd_actualizada.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
-csv_data = df_db.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Descargar CSV",
-    data=csv_data,
-    file_name="base_actualizada.csv",
+
+# Para CSV, bastará con codificar; “CodProd” ya es string
+csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📄 Descargar CSV",
+    data=csv_bytes,
+    file_name="bd_actualizada.csv",
     mime="text/csv"
 )
